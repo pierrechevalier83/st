@@ -66,6 +66,7 @@ char *argv0;
 #define MIN(a, b)		((a) < (b) ? (a) : (b))
 #define MAX(a, b)		((a) < (b) ? (b) : (a))
 #define LEN(a)			(sizeof(a) / sizeof(a)[0])
+#define NUMMAXLEN(x)		((int)(sizeof(x) * 2.56 + 0.5) + 1)
 #define DEFAULT(a, b)		(a) = (a) ? (a) : (b)
 #define BETWEEN(x, a, b)	((a) <= (x) && (x) <= (b))
 #define DIVCEIL(n, d)		(((n) + ((d) - 1)) / (d))
@@ -89,6 +90,8 @@ char *argv0;
 #define TLINE(y)		((y) < term.scr ? term.hist[((y) + term.histi - term.scr \
 				+ histsize + 1) % histsize] : term.line[(y) - term.scr])
 
+/* constants */
+#define ISO14755CMD		"dmenu -w %lu -p codepoint: </dev/null"
 
 enum glyph_attribute {
 	ATTR_NULL       = 0,
@@ -139,6 +142,8 @@ enum term_mode {
 	MODE_MOUSEMANY   = 1 << 18,
 	MODE_BRCKTPASTE  = 1 << 19,
 	MODE_PRINT       = 1 << 20,
+	MODE_UTF8        = 1 << 21,
+	MODE_SIXEL       = 1 << 22,
 	MODE_MOUSE       = MODE_MOUSEBTN|MODE_MOUSEMOTION|MODE_MOUSEX10\
 	                  |MODE_MOUSEMANY,
 };
@@ -156,10 +161,12 @@ enum charset {
 enum escape_state {
 	ESC_START      = 1,
 	ESC_CSI        = 2,
-	ESC_STR        = 4,  /* DCS, OSC, PM, APC */
+	ESC_STR        = 4,  /* OSC, PM, APC */
 	ESC_ALTCHARSET = 8,
 	ESC_STR_END    = 16, /* a final string was encountered */
 	ESC_TEST       = 32, /* Enter in test mode */
+	ESC_UTF8       = 64,
+	ESC_DCS        =128,
 };
 
 enum window_state {
@@ -325,6 +332,7 @@ static void xzoomabs(const Arg *);
 static void xzoomreset(const Arg *);
 static void printsel(const Arg *);
 static void printscreen(const Arg *) ;
+static void iso14755(const Arg *);
 static void toggleprinter(const Arg *);
 static void sendbreak(const Arg *);
 
@@ -426,6 +434,7 @@ static void tfulldirt(void);
 static void techo(Rune);
 static void tcontrolcode(uchar );
 static void tdectest(char );
+static void tdefutf8(char);
 static int32_t tdefcolor(int *, int *, int);
 static void tdeftran(char);
 static inline int match(uint, uint);
@@ -1174,8 +1183,7 @@ selnotify(XEvent *e)
 	 * Deleting the property again tells the selection owner to send the
 	 * next data chunk in the property.
 	 */
-	if (e->type == PropertyNotify)
-		XDeleteProperty(xw.dpy, xw.win, (int)property);
+	XDeleteProperty(xw.dpy, xw.win, (int)property);
 }
 
 void
@@ -1502,17 +1510,29 @@ ttyread(void)
 	if ((ret = read(cmdfd, buf+buflen, LEN(buf)-buflen)) < 0)
 		die("Couldn't read from shell: %s\n", strerror(errno));
 
-	/* process every complete utf8 char */
 	buflen += ret;
 	ptr = buf;
-	while ((charsize = utf8decode(ptr, &unicodep, buflen))) {
-		tputc(unicodep);
-		ptr += charsize;
-		buflen -= charsize;
-	}
 
+	for (;;) {
+		if (IS_SET(MODE_UTF8) && !IS_SET(MODE_SIXEL)) {
+			/* process a complete utf8 char */
+			charsize = utf8decode(ptr, &unicodep, buflen);
+			if (charsize == 0)
+				break;
+			tputc(unicodep);
+			ptr += charsize;
+			buflen -= charsize;
+
+		} else {
+			if (buflen <= 0)
+				break;
+			tputc(*ptr++ & 0xFF);
+			buflen--;
+		}
+	}
 	/* keep any uncomplete utf8 char for the next call */
-	memmove(buf, ptr, buflen);
+	if (buflen > 0)
+		memmove(buf, ptr, buflen);
 
 	if (term.scr > 0 && term.scr < histsize-1)
 		term.scr++;
@@ -1584,15 +1604,26 @@ void
 ttysend(char *s, size_t n)
 {
 	int len;
+	char *t, *lim;
 	Rune u;
 
 	ttywrite(s, n);
-	if (IS_SET(MODE_ECHO))
-		while ((len = utf8decode(s, &u, n)) > 0) {
-			techo(u);
-			n -= len;
-			s += len;
+	if (!IS_SET(MODE_ECHO))
+		return;
+
+	lim = &s[n];
+	for (t = s; t < lim; t += len) {
+		if (IS_SET(MODE_UTF8) && !IS_SET(MODE_SIXEL)) {
+			len = utf8decode(t, &u, n);
+		} else {
+			u = *t & 0xFF;
+			len = 1;
 		}
+		if (len <= 0)
+			break;
+		techo(u);
+		n -= len;
+	}
 }
 
 void
@@ -1686,7 +1717,7 @@ treset(void)
 		term.tabs[i] = 1;
 	term.top = 0;
 	term.bot = term.row - 1;
-	term.mode = MODE_WRAP;
+	term.mode = MODE_WRAP|MODE_UTF8;
 	memset(term.trantbl, CS_USA, sizeof(term.trantbl));
 	term.charset = 0;
 
@@ -2599,6 +2630,7 @@ strhandle(void)
 		xsettitle(strescseq.args[0]);
 		return;
 	case 'P': /* DCS -- Device Control String */
+		term.mode |= ESC_DCS;
 	case '_': /* APC -- Application Program Command */
 	case '^': /* PM -- Privacy Message */
 		return;
@@ -2678,6 +2710,30 @@ tprinter(char *s, size_t len)
 		close(iofd);
 		iofd = -1;
 	}
+}
+
+void
+iso14755(const Arg *arg)
+{
+	char cmd[sizeof(ISO14755CMD) + NUMMAXLEN(xw.win)];
+	FILE *p;
+	char *us, *e, codepoint[9], uc[UTF_SIZ];
+	unsigned long utf32;
+
+	snprintf(cmd, sizeof(cmd), ISO14755CMD, xw.win);
+	if (!(p = popen(cmd, "r")))
+		return;
+
+	us = fgets(codepoint, sizeof(codepoint), p);
+	pclose(p);
+
+	if (!us || *us == '\0' || *us == '-' || strlen(us) > 7)
+		return;
+	if ((utf32 = strtoul(us, &e, 16)) == ULONG_MAX ||
+	    (*e != '\n' && *e != '\0'))
+		return;
+
+	ttysend(uc, utf8encode(utf32, uc));
 }
 
 void
@@ -2767,6 +2823,15 @@ techo(Rune u)
 }
 
 void
+tdefutf8(char ascii)
+{
+	if (ascii == 'G')
+		term.mode |= MODE_UTF8;
+	else if (ascii == '@')
+		term.mode &= ~MODE_UTF8;
+}
+
+void
 tdeftran(char ascii)
 {
 	static char cs[] = "0B";
@@ -2796,9 +2861,12 @@ tdectest(char c)
 void
 tstrsequence(uchar c)
 {
+	strreset();
+
 	switch (c) {
 	case 0x90:   /* DCS -- Device Control String */
 		c = 'P';
+		term.esc |= ESC_DCS;
 		break;
 	case 0x9f:   /* APC -- Application Program Command */
 		c = '_';
@@ -2810,7 +2878,6 @@ tstrsequence(uchar c)
 		c = ']';
 		break;
 	}
-	strreset();
 	strescseq.type = c;
 	term.esc |= ESC_STR;
 }
@@ -2928,6 +2995,9 @@ eschandle(uchar ascii)
 	case '#':
 		term.esc |= ESC_TEST;
 		return 0;
+	case '%':
+		term.esc |= ESC_UTF8;
+		return 0;
 	case 'P': /* DCS -- Device Control String */
 	case '_': /* APC -- Application Program Command */
 	case '^': /* PM -- Privacy Message */
@@ -3007,10 +3077,15 @@ tputc(Rune u)
 	Glyph *gp;
 
 	control = ISCONTROL(u);
-	len = utf8encode(u, c);
-	if (!control && (width = wcwidth(u)) == -1) {
-		memcpy(c, "\357\277\275", 4); /* UTF_INVALID */
-		width = 1;
+	if (!IS_SET(MODE_UTF8) && !IS_SET(MODE_SIXEL)) {
+		c[0] = u;
+		width = len = 1;
+	} else {
+		len = utf8encode(u, c);
+		if (!control && (width = wcwidth(u)) == -1) {
+			memcpy(c, "\357\277\275", 4); /* UTF_INVALID */
+			width = 1;
+		}
 	}
 
 	if (IS_SET(MODE_PRINT))
@@ -3025,30 +3100,47 @@ tputc(Rune u)
 	if (term.esc & ESC_STR) {
 		if (u == '\a' || u == 030 || u == 032 || u == 033 ||
 		   ISCONTROLC1(u)) {
-			term.esc &= ~(ESC_START|ESC_STR);
+			term.esc &= ~(ESC_START|ESC_STR|ESC_DCS);
+			if (IS_SET(MODE_SIXEL)) {
+				/* TODO: render sixel */;
+				term.mode &= ~MODE_SIXEL;
+				return;
+			}
 			term.esc |= ESC_STR_END;
-		} else if (strescseq.len + len < sizeof(strescseq.buf) - 1) {
-			memmove(&strescseq.buf[strescseq.len], c, len);
-			strescseq.len += len;
-			return;
-		} else {
-		/*
-		 * Here is a bug in terminals. If the user never sends
-		 * some code to stop the str or esc command, then st
-		 * will stop responding. But this is better than
-		 * silently failing with unknown characters. At least
-		 * then users will report back.
-		 *
-		 * In the case users ever get fixed, here is the code:
-		 */
-		/*
-		 * term.esc = 0;
-		 * strhandle();
-		 */
+			goto check_control_code;
+		}
+
+
+		if (IS_SET(MODE_SIXEL)) {
+			/* TODO: implement sixel mode */
 			return;
 		}
+		if (term.esc&ESC_DCS && strescseq.len == 0 && u == 'q')
+			term.mode |= MODE_SIXEL;
+
+		if (strescseq.len+len >= sizeof(strescseq.buf)-1) {
+			/*
+			 * Here is a bug in terminals. If the user never sends
+			 * some code to stop the str or esc command, then st
+			 * will stop responding. But this is better than
+			 * silently failing with unknown characters. At least
+			 * then users will report back.
+			 *
+			 * In the case users ever get fixed, here is the code:
+			 */
+			/*
+			 * term.esc = 0;
+			 * strhandle();
+			 */
+			return;
+		}
+
+		memmove(&strescseq.buf[strescseq.len], c, len);
+		strescseq.len += len;
+		return;
 	}
 
+check_control_code:
 	/*
 	 * Actions of control codes must be performed as soon they arrive
 	 * because they can be embedded inside a control sequence, and
@@ -3071,6 +3163,8 @@ tputc(Rune u)
 				csihandle();
 			}
 			return;
+		} else if (term.esc & ESC_UTF8) {
+			tdefutf8(u);
 		} else if (term.esc & ESC_ALTCHARSET) {
 			tdeftran(u);
 		} else if (term.esc & ESC_TEST) {
@@ -3364,7 +3458,7 @@ xloadfont(Font *f, FcPattern *pattern)
 	FcResult result;
 	XGlyphInfo extents;
 
-	match = FcFontMatch(NULL, pattern, &result);
+	match = XftFontMatch(xw.dpy, xw.scr, pattern, &result);
 	if (!match)
 		return 1;
 
@@ -3429,9 +3523,6 @@ xloadfonts(char *fontstr, double fontsize)
 		}
 		defaultfontsize = usedfontsize;
 	}
-
-	FcConfigSubstitute(0, pattern, FcMatchPattern);
-	FcDefaultSubstitute(pattern);
 
 	if (xloadfont(&dc.font, pattern))
 		die("st: can't open font %s\n", fontstr);
